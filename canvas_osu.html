@@ -1,0 +1,768 @@
+<!--
+	Simple implementation of the circle-clicking rhythm game osu! for a single song/map https://osu.ppy.sh/home
+	osu documentation link for song map files: https://osu.ppy.sh/help/wiki/osu!_File_Formats/Osu_(file_format)
+
+	Map used on the normal difficulty: https://osu.ppy.sh/beatmapsets/740535#osu/1562308
+
+	NOTE: since JS is asynchronous language it's not possible to have accurate enough timings with
+	it so that timings would stay completely accurate until the end of the song.
+	i.e overall timing could of by 100ms at the end of the song
+-->
+<html>
+	<head>
+		<title>Canvas osu! v2</title>
+		<style>
+		html{
+			font-family: "Comic Sans MS";
+			text-align: center;
+		}
+		canvas{
+			margin-left:-320px;
+			position:absolute;
+			width:640px;
+			height:480px;
+			background:black;
+		}
+		body{
+			background:gray;
+		}
+		#startGameButton{
+			position:absolute;
+			margin-left:-50px;
+			margin-top:500px;
+		}
+		#instructions{
+			position:absolute;
+			margin-top:530px;
+			margin-left:300px;
+			margin-right:300px;
+		}
+		</style>
+		<script>
+			
+			const CANVAS_X = 640, CANVAS_Y = 480
+			//from osu documentation to fit the objects on the canvas correctly
+			const X_OFFSET = 64, Y_OFFSET = 48
+			const INTERVAL = 17 // ms -> about 60 fps
+
+			const CIRCLESIZE = 25
+			const CIRCLETEXTSIZE = 30
+			const OUTER_CIRCLESIZE = 75
+			const APPROACH_RATE = 1050
+			//if circle small = hard to keep within circle
+			// -> this over 0 increases radius over circle
+			const SLIDER_MOVE_HELP = 10
+			const DELAY_TO_SHOW_SCORE_AFTER_MAP_ENDS = 5000
+			const KEEP_CIRCLE_VISIBLE_MULT = 20 //time circle stays visible after perfect hitTime
+
+			const perfectHitTimeFrame = 50 //ms
+			const badHitTimeFrame = 300
+			const scoreForCircle = 100
+			const scoreforSliderTick = 3
+
+			const circleArColor = "orange"
+			const sliderArColor = "green"
+			const filledCircleColor = "white"
+
+			const sliderPixelChangeInInterval = 6
+
+			var gameScore = 0
+			var startGameTime = 0
+			var endGameTime = Infinity
+
+			//songElements/HitObjects row = [x, y, hitTime, type, (for slider x, y, x, y...), eComboI, id]
+			var songElements = [] //all objects 
+			var HitObjects = [] //current playable objects
+			var currentElementIndex = 0 //keeping track of songelements index
+			let elemetsWithPointsGiven = {}
+
+			var comboIndex = 1
+			
+			var currentPixelChange = 0
+			var currPointOnLine = 0
+			var currentSliderTotalLenght = 0
+			var totalProgressOnCurretSlider = 0
+			var currLine = 0
+
+			var totalEarlyHitDifference = 0 //is negative if clicking too early
+			var totalLateHitDifference = 0
+			var totalEarlyHits = 0
+			var totalLateHits = 0
+			var totalPerfectHits = 0
+			var totalSliderPoints = 0
+
+			var cursorCurrentLocation = []
+
+			var currentLocationOnSlider = 0 //for counting slider score
+			var pointGiven = false
+
+			var keyPressedDown = false
+
+			var hitTimingTextOnCanvas = [] //x, y, text, showTime start
+			const HIT_TIME_TEXT_LIFETIME = 400 //ms
+			const HIT_TIME_TEXT_THRESHOLD = 50 //ms
+			const HIT_TIME_TEXT_POS_OFFSET = 40 //px
+			const HIT_TIME_TEXT_COLOR = "purple"
+
+			function main(){
+				var canvas = initializeCanvas("canvas", CANVAS_X, CANVAS_Y)
+				
+				//read information about the hit objects in osu format
+				readFile("data.txt")
+			}
+
+			function readFile(file){
+				var rawFile = new XMLHttpRequest();
+				rawFile.open("GET", file, false);
+				rawFile.onreadystatechange = function (){
+					if(rawFile.readyState === 4){
+						if(rawFile.status === 200 || rawFile.status == 0){
+							var allText = rawFile.responseText;
+							let textLines = allText.split("\n");
+
+							//call function to parse needed data from lines
+							parseLines(textLines)
+						}
+					}
+				}
+				rawFile.send(null);
+			}
+
+			function parseLines(textLines){
+				let tempLines = [];
+				let temp, currInd = 0, commaIndex = 0;
+
+				//Four first comma separated elements from text
+				//x coordinate, y coordinate, timing, element type
+				for(let i = 0; i < textLines.length; i++){
+					temp = textLines[i];
+					currInd = 0, commaIndex = 0;
+					for(let i=0; i<4; i++){
+						currInd = temp.indexOf(",", commaIndex+1)
+						commaIndex = currInd
+					}
+					//Text untill fourth comma
+					temp = textLines[i].substr(0, commaIndex)
+
+					//Comma separated string to array
+					let array = temp.split(',')
+
+					//string to number
+					for(let i=0; i<array.length; i++){
+						array[i] = parseInt(array[i])
+					}
+
+					//get slider data if line is for slider
+					array = parseSliderData(textLines[i], array)
+
+					//at last index element position on combo it's part of
+					array = parseElementComboIndex(array)
+
+					//add id for element
+					array.push(i)
+					
+					//Add collected element data
+					songElements.push(array);
+				}
+			}
+
+			function parseElementComboIndex(array){
+				let currType = array[3]
+				//if start of new combo
+				if(currType == 5 || currType == 6)
+						comboIndex = 1
+				//part of ongoing combo
+				else
+					comboIndex++
+				array.push(comboIndex)
+				return array
+			}
+
+			function parseSliderData(textLine, array){
+				let temp = textLine
+				let sliderX = 0, sliderY = 0;
+				if(array[3] == 2 || array[3] == 6){
+					temp = temp.substr( temp.indexOf("|")+1 )
+					sliderX = temp.substr( 0, temp.indexOf(":") )
+					array.push(parseInt(sliderX))
+									
+					//While slider has next points
+					while( temp.indexOf("|") < temp.indexOf(",") ){
+						sliderY = temp.substr( temp.indexOf(":")+1, temp.indexOf("|") )
+						sliderY = sliderY.substr( 0, sliderY.indexOf("|") )
+						array.push(parseInt(sliderY))
+						//remove first line point
+						temp = temp.substr( temp.indexOf("|")+1 )
+						//next x coordinate for slider
+						sliderX = temp.substr( 0, temp.indexOf(":") )
+						array.push(parseInt(sliderX))
+					}
+					//Last y coordinate of slider
+					sliderY = temp.substr( temp.indexOf(":")+1, temp.indexOf(",") )
+					sliderY = sliderY.substr( 0, sliderY.indexOf(",") )
+					array.push(parseInt(sliderY))
+				}
+				return array;
+			}
+
+			function startGame(){
+
+				document.getElementById("startGameButton").disabled = true
+
+				endGameTime = songElements[songElements.length-1][2] + DELAY_TO_SHOW_SCORE_AFTER_MAP_ENDS
+
+				var canvas = initializeCanvas("canvas", CANVAS_X, CANVAS_Y)
+
+				playAudio()
+				gameLoop(canvas)
+
+				canvas.addEventListener('mousemove', function(){
+					onMouseMove(event)
+				});
+
+				window.addEventListener('keypress', function(){
+					onKeyDown(event)
+					event.preventDefault()
+				});
+
+				window.addEventListener('keyup', function(){
+					onKeyUp(event)
+					event.preventDefault()
+				});
+			}
+
+			function onKeyDown(e){
+				let key = e.which || e.keyCode;
+				if((key == 32 || key == 90)){ // 32 spacebar, 90 z
+					handlePressedCircle(cursorCurrentLocation)
+					keyPressedDown = true
+				}
+			};
+
+			function onKeyUp(e){
+				let key = e.which || e.keyCode;
+				if ((key == 32 || key == 90))
+					keyPressedDown = false
+			};
+
+			function onMouseMove(e){
+				let location = getCursorPosition(e)
+				cursorCurrentLocation = location
+			};
+
+			function gameLoop(canvas){
+
+				setInterval(function(){
+
+					if(gameTime() < endGameTime){
+						clearCanvas(canvas);
+
+						//show score
+						drawText(canvas, "Score: " + Math.floor(gameScore), CANVAS_X/16, 25, 20, "white", false)
+						
+						//show average hitdifference
+						let temp = average((totalEarlyHitDifference + totalLateHitDifference), (totalEarlyHits + totalLateHits))
+						drawText(canvas, "Avg HTD: " + Math.floor(temp), CANVAS_X/16, CANVAS_Y - 25, 20, "white", false)
+
+						//add visible objects
+						addHitObjects()
+
+						//remove old objects 
+						removeHitObjects()
+
+						//show on canvas how good cicle hitTime was if worse than threshold
+						showOrHideHitTimeTexts(canvas)
+
+						//showNotClickedCircleText(canvas)
+
+						//draw active circles on canvas
+						drawActiveCircles(canvas)
+
+						//draw active sliders on canvas
+						drawActiveSliders(canvas)
+
+						//check if on slider and give points if it is at right time
+						if(keyPressedDown)
+							handleActiveSlider(cursorCurrentLocation)
+
+						//sync time: setinterval inaccuracy kills this 
+						//gameTime = Date.now() - startGameTime
+					}else{
+						clearCanvas(canvas)
+						endGameScreen(canvas)
+					}
+				},INTERVAL);
+			}
+
+			function gameTime(){
+				return (Date.now() - startGameTime)
+			}
+
+			function showOrHideHitTimeTexts(canvas){
+				for(let i=0; i<hitTimingTextOnCanvas.length; i++){
+					let text = hitTimingTextOnCanvas[i][2]
+					//if should be visible
+					if( ((Date.now() - hitTimingTextOnCanvas[i][3]) < HIT_TIME_TEXT_LIFETIME)
+						&& ( (Math.abs(text) > HIT_TIME_TEXT_THRESHOLD)
+						|| (text == "X") ) ){
+						let x = hitTimingTextOnCanvas[i][0] + HIT_TIME_TEXT_POS_OFFSET
+						let y = hitTimingTextOnCanvas[i][1] - HIT_TIME_TEXT_POS_OFFSET
+						drawText(canvas, text, x, y, CIRCLETEXTSIZE, HIT_TIME_TEXT_COLOR, false)
+					}
+					else
+						hitTimingTextOnCanvas.splice(i, 1)
+				}
+			}
+
+			function addHitObjects(){
+
+				if(currentElementIndex < songElements.length){
+					while((gameTime()+APPROACH_RATE) >= songElements[currentElementIndex][2]){
+						HitObjects.push(songElements[currentElementIndex])
+
+						if(currentElementIndex < songElements.length-1)
+							currentElementIndex++
+						else
+							break
+					}
+				}
+			}
+
+			function removeHitObjects(){
+				for(let i = 0; i < HitObjects.length; i++){
+					let elementTime = HitObjects[i][2]
+					let eType = HitObjects[i][3]
+
+					//console.log("elemetsWithPointsGiven " + JSON.stringify(elemetsWithPointsGiven))
+
+					//slider
+					if(eType == 2 || eType == 6){
+						let sliderpoints = getSliderPoints(HitObjects[i]);
+						let lineLengths = getLineLenghts(sliderpoints);
+						let thisSliderTotalLineLength = getSliderTotalLineLength(lineLengths)
+						//calculate the time slider is visible
+						let lifetime = (thisSliderTotalLineLength / sliderPixelChangeInInterval) * INTERVAL
+
+						if(gameTime() >= elementTime + lifetime)
+							HitObjects.splice(i, 1)
+					}
+					//circle
+					else if(gameTime() >= elementTime + INTERVAL*KEEP_CIRCLE_VISIBLE_MULT){
+						//miss text work on canvas if not clicked
+						if( !((HitObjects[i][HitObjects[i].length-1]) in elemetsWithPointsGiven) ){
+							let x = HitObjects[i][0] + X_OFFSET
+							let y = HitObjects[i][1] + Y_OFFSET
+							hitTimingTextOnCanvas.push([x, y, "X", Date.now()])
+						}
+						HitObjects.splice(i, 1)
+					}
+				}
+			}
+
+			function drawActiveCircles(canvas){
+				let percentDiff = 0, outerCircleSize = 0;
+
+				for(let i = 0; i < HitObjects.length; i++){
+					//skip if not circle
+					if(HitObjects[i][3] != 1 && HitObjects[i][3] != 5)
+						continue
+
+					//todo: add line to next circle
+					
+					percentDiff = getElementHitTimePercentDiff(HitObjects[i])
+
+					//calculate current outer circle size
+					outerCircleSize = OUTER_CIRCLESIZE - ((OUTER_CIRCLESIZE-CIRCLESIZE)*percentDiff)
+
+					let x = HitObjects[i][0] + X_OFFSET;
+					let y = HitObjects[i][1] + Y_OFFSET;
+					drawFilledCircle(canvas, x, y, CIRCLESIZE, filledCircleColor);
+					drawCircle(canvas, x, y, outerCircleSize, circleArColor);
+					drawText(canvas, HitObjects[i][HitObjects[i].length-2], x, y, CIRCLETEXTSIZE, "black");
+				}
+			}
+
+			function drawActiveSliders(canvas){
+				let percentDiff = 0, outerCircleSize = 0, x = 0, y = 0
+				let sliderpoints = [], lineLengths = [], currentCircleLocation = []
+
+				if(HitObjects.length > 0){
+					for(let i = 0; i < HitObjects.length; i++){
+						//skip if not slider
+						if(HitObjects[i][3] != 2 && HitObjects[i][3] != 6)
+							continue
+							
+						percentDiff = getElementHitTimePercentDiff(HitObjects[i])
+
+						//calculate current outer circle size
+						outerCircleSize = OUTER_CIRCLESIZE - ((OUTER_CIRCLESIZE-CIRCLESIZE)*percentDiff)
+
+						sliderpoints = getSliderPoints(HitObjects[i])
+
+						drawPolyline(canvas, sliderpoints)
+
+						//moving on slider
+						if(percentDiff >= 1){
+
+							// todo: fix miss for sliders
+							if( !((HitObjects[i][HitObjects[i].length-1]) in elemetsWithPointsGiven) ){
+								let x = HitObjects[i][0] + X_OFFSET
+								let y = HitObjects[i][1] + Y_OFFSET
+								hitTimingTextOnCanvas.push([x, y, "X", Date.now()])
+							}
+
+							let begin = sliderpoints[0]
+							let end = sliderpoints[1]
+							lineLengths = getLineLenghts(sliderpoints);
+							currentCircleLocation = getCoordinateChangeForLine(begin, end, lineLengths, sliderpoints)
+							x = currentCircleLocation[0]
+							y = currentCircleLocation[1]
+							//update current location on slider
+							currentLocationOnSlider = [x, y]
+							drawFilledCircle(canvas, x, y, CIRCLESIZE, filledCircleColor)
+							drawCircle(canvas, x, y, outerCircleSize + SLIDER_MOVE_HELP, sliderArColor)					
+							drawText(canvas, HitObjects[i][HitObjects[i].length-2], x, y, CIRCLETEXTSIZE, "black")
+							pointGiven = false
+						}
+						//slider start circle approach
+						else{
+							x = HitObjects[i][0] + X_OFFSET
+							y = HitObjects[i][1] + Y_OFFSET
+							drawFilledCircle(canvas, x, y, CIRCLESIZE, filledCircleColor)
+							drawCircle(canvas, x, y, outerCircleSize, sliderArColor)
+							drawText(canvas, HitObjects[i][HitObjects[i].length-2], x, y, CIRCLETEXTSIZE, "black")
+						}
+					}
+				}
+			}
+
+			function getElementHitTimePercentDiff(elementRow){
+				//get difference to element "hit time"
+				timeDifference = gameTime() - elementRow[2]
+
+				//difference as percent diff
+				if(timeDifference < 0){
+					timeDifference = timeDifference*(-1)
+					percentDiff = (APPROACH_RATE-timeDifference) / APPROACH_RATE
+				}else{
+					percentDiff = 1
+				}
+				return percentDiff
+			}
+
+			function getLineLenghts(sliderpoints){
+				let lineLengths = [], dist = 0
+				for(let i=0; i<sliderpoints.length-1; i++){
+					dist = distance(sliderpoints[i], sliderpoints[(i+1)])
+					lineLengths.push(dist)
+				}
+				return lineLengths
+			}
+
+			function getCoordinateChangeForLine(begin, end, lineLengths, sliderpoints){
+				let currentX = 0, currentY = 0
+
+				let thisSliderTotalLineLength = getSliderTotalLineLength(lineLengths)
+
+				//check if first slider of the map
+				if(currentSliderTotalLenght == 0)
+					currentSliderTotalLenght = thisSliderTotalLineLength
+
+				//check if slider has changed
+				if(thisSliderTotalLineLength != currentSliderTotalLenght){
+					currLine = 0
+					currPointOnLine = 0
+					totalProgressOnCurretSlider = 0
+					currentSliderTotalLenght = thisSliderTotalLineLength
+				}
+				
+				//if line change on slider
+				if(currPointOnLine > lineLengths[currLine] && lineLengths.length > 1){
+					currLine++
+					currPointOnLine = 0
+				}
+
+				//if on second line
+				if(currLine == 1){
+					begin = sliderpoints[currLine]
+					end = sliderpoints[currLine+1]
+				}
+				//after second line
+				if(currLine > 1){
+					begin = sliderpoints[currLine+1]
+					end = sliderpoints[currLine+2]
+				}
+
+				//to get % progress on current line
+				let progress = 1 - ( (lineLengths[currLine]-currPointOnLine)/lineLengths[currLine] )
+
+				currentX = begin[0] + (end[0] - begin[0]) * progress
+				currentY = begin[1] + (end[1] - begin[1]) * progress
+
+				//add progress
+				currPointOnLine += sliderPixelChangeInInterval
+				totalProgressOnCurretSlider += sliderPixelChangeInInterval
+
+				//just in case reached end of slide before it should (if slider lifetime set wrong)
+				if(totalProgressOnCurretSlider > thisSliderTotalLineLength){
+					currLine = 0
+					return sliderpoints[sliderpoints.length-1]
+				}
+
+				return [currentX, currentY]
+			}
+
+			function getSliderTotalLineLength(lineLengths){
+				let tempLenght = 0
+				for(let i=0; i<lineLengths.length; i++){
+					tempLenght += lineLengths[i]
+				}
+				return tempLenght
+			}
+
+			function getSliderPoints(element){
+				var sliderpoints = [];
+				//starting point
+				var x = element[0] + X_OFFSET;
+				var y = element[1] + Y_OFFSET;
+				sliderpoints.push([x, y]);
+				let addedInd = 0;
+				//slider points start at index 4
+				for(var i = 4; i < element.length-2; i += 2){
+					x = element[i] + X_OFFSET;
+					y = element[i+1] + Y_OFFSET;
+					//osu's B(Bézier) type sliders have same coordinate twice -> skip duplicate
+					if(sliderpoints[addedInd][0] != x){
+						sliderpoints.push([x, y]);
+						addedInd++
+					}
+				}
+				return sliderpoints;
+			}
+
+			function handleActiveSlider(cursorCurrentLocation){
+				var minDist = Infinity;
+				var index = -1;
+				var x = 0, y = 0;
+				for(var i=0; i<HitObjects.length; i++){
+					//skip if not slider
+					if(HitObjects[i][3] != 2 && HitObjects[i][3] != 6)
+						continue
+					var hitObjectCenter = currentLocationOnSlider;
+					var dist = distance(cursorCurrentLocation, currentLocationOnSlider);
+					if(dist<minDist && dist<=CIRCLESIZE+SLIDER_MOVE_HELP){
+						minDist=dist;                           
+						index=i;
+					}
+				}
+				if(index!=-1){
+					//console.log("ON SLIDER AYAYA")
+					totalSliderPoints += scoreforSliderTick;
+					gameScore += scoreforSliderTick;
+				}
+			}
+
+			function handlePressedCircle(location){
+				let minDist = Infinity
+				let index = -1
+				let x = 0, y = 0
+				for(let i=0; i<HitObjects.length; i++){
+					x = HitObjects[i][0] + X_OFFSET
+					y = HitObjects[i][1] + Y_OFFSET
+					let hitObjectCenter = [x, y]
+					let dist = distance(location,hitObjectCenter)
+					if(dist<minDist && dist<=CIRCLESIZE){
+						minDist = dist
+						index = i
+					}
+				}
+				if(index==-1){
+					console.log("You clicked nothing or your cursor is on slider!")
+				}else{
+					//set so that circle is given point marked by element id
+					elemetsWithPointsGiven[ HitObjects[index][HitObjects[index].length-1] ] = true
+					//a regular circle
+					if(HitObjects[index][3] == 1 || HitObjects[index][3] == 5){
+						giveCircleScore(HitObjects[index])
+						HitObjects.splice(index,1)
+					}
+					//start circle of slider
+					else if((HitObjects[index][3] == 2 || HitObjects[index][3] == 6) && pointGiven == false){
+						giveCircleScore(HitObjects[index])
+						//cirle of slider is not deleted after it is clicked
+						// -> only give circle click score once
+						pointGiven = true
+					}
+				}
+			}
+
+			//give score based on timing and update some statistics
+			function giveCircleScore(HitObject){
+
+				let clickTime = Date.now() - startGameTime
+				let objectTime = HitObject[2]
+
+				let timeDifference = clickTime - objectTime
+
+				//check if click time early or late if out of perfect hit time threshold
+				if((Math.abs(timeDifference) > perfectHitTimeFrame)){
+					if(timeDifference < 0){
+						totalEarlyHits++
+						totalEarlyHitDifference += timeDifference
+					}else{
+						totalLateHits++
+						totalLateHitDifference += timeDifference
+					}
+				}
+
+				//to show how good hit timing was on canvas next to circle
+				let x = HitObject[0]+X_OFFSET, y = HitObject[1]+Y_OFFSET
+				hitTimingTextOnCanvas.push([x, y, timeDifference, Date.now()])
+				
+				timeDifference = Math.abs(timeDifference);
+				let percent = 0;
+
+				//perfect timing within threshold
+				if(timeDifference <= perfectHitTimeFrame){
+					percent = 1
+					totalPerfectHits++
+				}
+				//either too late or too early & out of threshold -> 0 score
+				else if(timeDifference > badHitTimeFrame)
+					percent = 0
+				//within threshold but too early or too late from perfect timing
+				else
+					percent = 1 - ( (badHitTimeFrame - timeDifference) / badHitTimeFrame )
+
+				gameScore += scoreForCircle * percent
+			}
+
+			function average(sum, count){
+				return sum/count
+			}
+
+			function playAudio(){
+				var audio = document.createElement('audio');
+				audio.src='audio.mp3';
+				audio.load();
+				audio.autoplay=true;
+				startGameTime = Date.now();
+			}
+			
+			function getCursorPosition(event){
+				var canvas=event.target;
+				var rect = canvas.getBoundingClientRect();
+				var x=event.clientX - rect.left;
+				var y=event.clientY - rect.top;
+				return [x,y];
+			}
+						
+			function drawPolyline(canvas,points){
+				var ctx = canvas.getContext("2d");
+				ctx.beginPath();
+				ctx.moveTo(points[0][0], points[0][1]);
+				for(var i=1;i<points.length;i++){
+					ctx.lineTo(points[i][0], points[i][1]);
+				}
+				ctx.strokeStyle = "red";
+				ctx.stroke();
+			}
+
+			function drawCircle(canvas, locationX, locationY, radius, color){
+				var ctx = canvas.getContext("2d");
+				ctx.beginPath();
+				ctx.arc(locationX, locationY, radius, 0, 2 * Math.PI);
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = color;
+				ctx.stroke();
+			}
+			
+			function drawFilledCircle(canvas, locationX, locationY, radius, color){
+				var ctx = canvas.getContext("2d");
+				ctx.beginPath();
+				ctx.arc(locationX, locationY, radius, 0, 2 * Math.PI);
+				ctx.fillStyle = color;
+				ctx.fill();
+				ctx.strokeStyle = color;
+				ctx.stroke();
+			}
+
+			function drawText(canvas, text, locationX, locationY, fontSize, color, isCentered=true){
+				var ctx = canvas.getContext("2d");
+				ctx.fillStyle = color;
+				ctx.textBaseline = "middle";
+				
+				if(isCentered)
+					ctx.textAlign = "center";
+				else
+					ctx.textAlign = "left";					
+				
+				ctx.font = fontSize + "px Comic Sans MS";
+				ctx.fillText(text, locationX, locationY);
+			}
+			
+			function distance(v1,v2){
+				// general
+				var dist=0;
+				for(var i=0;i<v1.length;i++){
+					dist+=((v1[i]-v2[i])*(v1[i]-v2[i]));
+				}
+				return Math.sqrt(dist);
+			}
+			
+			function initializeCanvas(canvasID,width,height){
+				var c = document.getElementById(canvasID);
+				var ctx = c.getContext("2d");
+				ctx.canvas.width=width;
+				ctx.canvas.height=height;
+				return c;
+			}
+			
+			function clearCanvas(canvas){
+				var ctx = canvas.getContext("2d");
+				ctx.clearRect(0,0,CANVAS_X,CANVAS_Y);
+			}
+
+			function endGameScreen(canvas){
+
+				let allText = [];
+				allText.push("Congratulations!")
+				allText.push("Your score: " + Math.floor(gameScore));
+				allText.push("Total slider points: " + totalSliderPoints);
+				allText.push("Total perfect hits (+100 score): " + totalPerfectHits);
+				allText.push("Early hits: " + totalEarlyHits);
+				allText.push("Late hits: " + totalLateHits);
+				allText.push("Avg early hit error: " + Math.floor(average(totalEarlyHitDifference, totalEarlyHits)));
+				allText.push("Avg late hit error: " + Math.floor(average(totalLateHitDifference, totalLateHits)));
+
+				for(let i = 0; i < allText.length; i++){
+					drawText(canvas, allText[i], CANVAS_X/2, 50 + 35*i, 20, "white", true);
+				}
+			}
+
+		</script>
+	</head>
+	<body onload="main()">
+		<div>
+			<h1 id="title">Canvas osu! v2</h1>
+			<canvas id="canvas"></canvas>
+			<button id="startGameButton" onclick="startGame()">Start game!</button>
+		</div>
+		<div id ="instructions">
+			<p>
+				Welcome to Canvas Osu!, which is a simplified version of the actual game. To play the game hit the objects with SPACEBAR 
+				when the outer circle hits the circle (based on timing of the song). Your get rewarded more points for better timing. There 
+				is 2 kinds of elements, circles and sliders. Circles disappear on click and give you points, on sliders you have to hit the 
+				slider on the correct timing and keep the spacebar down for the duration of the slider.
+				Enjoy game!
+			</p>
+			<br>
+			<br>
+			<br>
+			<br>
+			<p>
+				Song name: C U Again by Cartoon & Futuristik Feat. Mikk Mae (Normal difficulty) <a href="https://osu.ppy.sh/beatmapsets/740535#osu/1562308">Link to osu map</a>
+			</p>
+		</div>
+	</body>
+</html>
